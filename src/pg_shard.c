@@ -138,8 +138,8 @@ static void TupleStoreToTable(RangeVar *tableRangeVar, List *remoteTargetList,
 static void PgShardExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count);
 static int32 ExecuteDistributedModify(DistributedPlan *distributedPlan);
 static void PrepareDtmTransaction(Task *task);
-static int SendDtmBeginTransaction(PGconn *connection);
-static bool SendDtmJoinTransaction(PGconn *connection, int TransactionId);
+static int64 SendDtmBeginTransaction(PGconn *connection);
+static bool SendDtmJoinTransaction(PGconn *connection, int64 TransactionId);
 static bool SendCommand(PGconn *connection, char *command);
 static void FinishDtmTransaction(XactEvent event, void *arg);
 static void ExecuteSingleShardSelect(DistributedPlan *distributedPlan,
@@ -176,7 +176,8 @@ static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 
 /* XTM stuff */
 static List *connectionsWithDtmTransactions = NIL;
-static int currentGlobalTransactionId = 0;
+static int64 currentGlobalTransactionId = 0;
+static int   currentLocalTransactionId = 0;
 static bool commitCallbackSet = false;
 
 #define TRACE(fmt, ...) fprintf(stderr, fmt, ## __VA_ARGS__)
@@ -2098,15 +2099,15 @@ PrepareDtmTransaction(Task *task)
 }
 
 
-static int
+static int64
 SendDtmBeginTransaction(PGconn *connection)
 {
 	PGresult *result = NULL;
 	char *resp = NULL;
-	int remoteTransactionId;
+	int64 remoteTransactionId;
 
-
-	result = PQexec(connection, "SELECT dtm_begin_transaction()");
+    
+	result = PQexec(connection, psprintf("SELECT dtm_extend('%d.%d')", MyProcPid, ++currentLocalTransactionId));
 	if (PQresultStatus(result) != PGRES_TUPLES_OK)
 	{
 		ReportRemoteError(connection, result);
@@ -2122,21 +2123,19 @@ SendDtmBeginTransaction(PGconn *connection)
 		return 0;
 	}
 
-	remoteTransactionId = strtol(resp, (char **)NULL, 10);
+    sscanf(resp, "%%ld", &remoteTransactionId);
+	PQclear(result);
 	return remoteTransactionId;
 }
 
 
 static bool
-SendDtmJoinTransaction(PGconn *connection, int TransactionId)
+SendDtmJoinTransaction(PGconn *connection, int64 TransactionId)
 {
 	PGresult *result = NULL;
-	StringInfo beginQuery = makeStringInfo();
 	bool resultOK = true;
 
-	appendStringInfo(beginQuery, "SELECT dtm_join_transaction(%u)", TransactionId);
-
-	result = PQexec(connection, beginQuery->data);
+	result = PQexec(connection, psprintf("SELECT dtm_access(%lu, '%d.%d')", TransactionId, MyProcPid, currentLocalTransactionId);
 	if (PQresultStatus(result) != PGRES_TUPLES_OK)
 	{
 		ReportRemoteError(connection, result);
@@ -2172,52 +2171,145 @@ static void
 FinishDtmTransaction(XactEvent event, void *arg)
 {
 	ListCell *connectionCell = NULL;
-	char *endQuery = NULL;
 
+
+	if (!(event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT) 
+        || !connectionsWithDtmTransactions)
+    {
+		return;
+    }
 	if (event == XACT_EVENT_COMMIT)
-	{
-		endQuery = "END";
-	}
-	else if (event == XACT_EVENT_ABORT)
-	{
-		endQuery = "ROLLBACK";
-	}
-	else
-	{
-		return;
-	}
+    {
+        book allOk = true;
+        int querySent = 0;
+        PGresult *result = NULL;
+        PGconn *connection = NULL;
+        int64 csn = 0;
 
-	if (!connectionsWithDtmTransactions)
-		return;
-
-	foreach(connectionCell, connectionsWithDtmTransactions)
-	{
-		PGconn *connection = (PGconn *) lfirst(connectionCell);
-		int querySent = PQsendQuery(connection, endQuery);
-		if (querySent == 0)
-		{
-			ReportRemoteError(connection, NULL);
-			PurgeConnection(connection);
-			continue;
-		}
-		TRACE("shard_xtm: conn#%p: Sent COMMIT to %s:%s\n", connection, PQhost(connection), PQport(connection));
-	}
-
-	foreach(connectionCell, connectionsWithDtmTransactions)
-	{
-		PGconn *connection = (PGconn *) lfirst(connectionCell);
-		PGresult *result = PQgetResult(connection);
-		if (PQresultStatus(result) != PGRES_COMMAND_OK)
-		{
-			ReportRemoteError(connection, result);
-		}
-
-	        PQclear(result);
-
-		/* clear NULL result */
-		PQgetResult(connection);
-	}
-
+        foreach(connectionCell, connectionsWithDtmTransactions)
+        {
+            connection = (PGconn *) lfirst(connectionCell);
+            querySent = PQsendQuery(connection, psprintf("dtm_begin_prepare('%d.%d')", MyProcPid, currentLocalTransactionId));
+            if (querySent == 0)
+            {
+                ReportRemoteError(connection, NULL);
+                PurgeConnection(connection);
+                allOk = false;
+                continue;
+            }
+            TRACE("shard_xtm: conn#%p: Sent dtm_begin_prepar to %s:%s\n", connection, PQhost(connection), PQport(connection));
+        }
+        if (allOk) 
+        { 
+            foreach(connectionCell, connectionsWithDtmTransactions)
+            {
+                connection = (PGconn *) lfirst(connectionCell);
+                result = PQgetResult(connection);
+                if (PQresultStatus(result) == PGRES_TUPLES_OK)
+                {
+                    querySent = PQsendQuery(connection, psprintf("dtm_prepare('%d.%d',%lld)", MyProcPid, currentLocalTransactionId, csn));
+                    if (querySent == 0)
+                    {
+                        ReportRemoteError(connection, NULL);
+                        PurgeConnection(connection);
+                        allOk = false;
+                        continue;
+                    } else { 
+                        TRACE("shard_xtm: conn#%p: Sent dtm_prepare to %s:%s\n", connection, PQhost(connection), PQport(connection));
+                        result = PQgetResult(connection);
+                        if (PQresultStatus(result) == PGRES_TUPLES_OK)
+                        {
+                            sscanf(resp, "%%ld", &csn);                   
+                        } else {
+                            ReportRemoteError(connection, result);
+                            allOk = false;
+                        }            
+                    }
+                } else { 
+                    ReportRemoteError(connection, result);
+                    allOk = false;
+                }
+                PQclear(result);
+            }
+            if (allOk) 
+            {
+                foreach(connectionCell, connectionsWithDtmTransactions)
+                {
+                    connection = (PGconn *) lfirst(connectionCell);
+                    querySent = PQsendQuery(connection, psprintf("dtm_end_prepare('%d.%d',%lld)", MyProcPid, currentLocalTransactionId, csn));
+                    if (querySent == 0)
+                    {
+                        ReportRemoteError(connection, NULL);
+                        PurgeConnection(connection);
+                        allOk = false;
+                        continue;
+                    } 
+                    TRACE("shard_xtm: conn#%p: Sent dtm_end_prepare to %s:%s\n", connection, PQhost(connection), PQport(connection));
+                }
+                if (allOk)
+                {
+                    foreach(connectionCell, connectionsWithDtmTransactions)
+                    {
+                        connection = (PGconn *) lfirst(connectionCell);
+                        result = PQgetResult(connection);
+                        if (PQresultStatus(result) != PGRES_TUPLES_OK)
+                        {
+                            ReportRemoteError(connection, result);
+                            PQclear(result);
+                            allOk = false;
+                        } else { 
+                            PQclear(result);
+                            querySent = PQsendQuery(connection, psprintf("commit prepared '%d.%d'", MyProcPid, currentLocalTransactionId));
+                            if (querySent == 0)
+                            {
+                                ReportRemoteError(connection, NULL);
+                                PurgeConnection(connection);
+                                allOk = false;
+                                continue;
+                            }
+                            TRACE("shard_xtm: conn#%p: Sent COMMIT PREPARED to %s:%s\n", connection, PQhost(connection), PQport(connection));
+                        }
+                    }
+                    if (allOk)
+                    {
+                        foreach(connectionCell, connectionsWithDtmTransactions)
+                        {
+                            connection = (PGconn *) lfirst(connectionCell);
+                            result = PQgetResult(connection);
+                            if (PQresultStatus(result) != PGRES_COMMAND_OK)
+                            {
+                                ReportRemoteError(connection, result);
+                                allOk = false;
+                            }
+                            PQclear(result);
+                        }
+                        if (allOk)
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        foreach(connectionCell, connectionsWithDtmTransactions)
+        {
+            connection = (PGconn *) lfirst(connectionCell);
+            querySent = PQsendQuery(connection, psprintf("rollback prepared '%d.%d'", MyProcPid, currentLocalTransactionId));
+            if (querySent == 0)
+            {       
+                ReportRemoteError(connection, NULL);
+                PurgeConnection(connection);
+            } else { 
+                TRACE("shard_xtm: conn#%p: Sent ROLLBACK PREPARED to %s:%s\n", connection, PQhost(connection), PQport(connection));
+                result = PQgetResult(connection);
+                if (PQresultStatus(result) != PGRES_COMMAND_OK)
+                {
+                    ReportRemoteError(connection, result);
+                }
+                 PQclear(result);
+            }
+        }
+    }
 	/*
 	 * Calling unregister inside callback itself leads to segfault when
 	 * there are several callbacks on the same event.
