@@ -2166,207 +2166,96 @@ SendCommand(PGconn *connection, char *command)
 	return resultOK;
 }
 
+typedef bool (*DtmCommandResultHandler)(PGresult *result, void* arg);
+
+static bool RunDtmStatement(char const* sql, unsigned expectedStatus, DtmCommandResultHandler handler, void* arg)
+{
+	ListCell *connectionCell = NULL;
+	int querySent = 0;
+	PGresult *result = NULL;
+	PGconn *connection = NULL;
+	bool allOk = true;
+
+	foreach(connectionCell, connectionsWithDtmTransactions)
+	{
+		connection = (PGconn *) lfirst(connectionCell);
+		querySent = PQsendQuery(connection, sql);
+		if (!querySent)
+		{
+			ReportRemoteError(connection, NULL);
+			PurgeConnection(connection);
+			allOk = false;
+			continue;
+		}
+		TRACE("shard_xtm: conn#%p: Sent %s to %s:%s\n", connection, sql, PQhost(connection), PQport(connection));
+	}
+	foreach(connectionCell, connectionsWithDtmTransactions)
+	{
+		connection = (PGconn *) lfirst(connectionCell);
+		result = PQgetResult(connection);
+		if (PQresultStatus(result) != expectedStatus || (handler && !handler(result, arg)))
+		{
+			ReportRemoteError(connection, result);
+			allOk = false;
+		}
+		PQclear(result);
+		PQresultStatus(result); /* consume NULL result */
+	}	
+	return allOk;
+}
+
+static bool RunDtmCommand(char const* sql)
+{
+	return RunDtmStatement(sql, PGRES_COMMAND_OK, NULL, NULL);
+}
+
+static bool RunDtmFunction(char const* sql)
+{
+	return RunDtmStatement(sql, PGRES_TUPLES_OK, NULL, NULL);
+}
+
+
+static bool DtmMaxCSN(PGresult *result, void* arg)
+{
+	char* resp = PQgetvalue(result, 0, 0);
+	csn_t* maxCSN = (csn_t*)arg;
+	csn_t csn = 0;
+	if (resp == NULL || (*resp) == '\0' || sscanf(resp, "%lld", &csn) != 1)
+	{
+		return false;
+	} else {
+		if (*maxCSN < csn)
+		{
+			*maxCSN = csn;
+		}
+		return true;
+	}
+}
+
 
 static void
 FinishDtmTransaction(XactEvent event, void *arg)
 {
-	ListCell *connectionCell = NULL;
-	bool allOk = true;
-	int querySent = 0;
-	PGresult *result = NULL;
-	PGconn *connection = NULL;
-	csn_t maxCSN = 0;
-
-
 	if (!(event == XACT_EVENT_COMMIT || event == XACT_EVENT_ABORT) 
         || !connectionsWithDtmTransactions)
     {
 		return;
     }
-	if (event == XACT_EVENT_ABORT)
+	if (event == XACT_EVENT_COMMIT)
     {
-        foreach(connectionCell, connectionsWithDtmTransactions)
-        {
-            connection = (PGconn *) lfirst(connectionCell);
-			while ((result = PQgetResult(connection)) != NULL) { 
-				PQclear(result);
-			}
-			querySent = PQsendQuery(connection, "ROLLBACK");
-			if (querySent == 0)
-			{
-				ReportRemoteError(connection, NULL);
-				PurgeConnection(connection);
-			}
+		csn_t maxCSN = 0;
+
+		if (!RunDtmCommand(psprintf("PREPARE TRANSACTION '%d.%d'", MyProcPid, currentLocalTransactionId)) ||
+			!RunDtmFunction(psprintf("SELECT dtm_begin_prepare('%d.%d')", MyProcPid, currentLocalTransactionId)) ||
+			!RunDtmStatement(psprintf("SELECT dtm_prepare('%d.%d',0)", MyProcPid, currentLocalTransactionId), PGRES_TUPLES_OK, DtmMaxCSN, &maxCSN) ||
+			!RunDtmFunction(psprintf("SELECT dtm_end_prepare('%d.%d',%lld)", MyProcPid, currentLocalTransactionId, maxCSN)) ||
+			!RunDtmCommand(psprintf("COMMIT PREPARED '%d.%d'", MyProcPid, currentLocalTransactionId)))
+		{
+			RunDtmCommand(psprintf("ROLLBACK PREPARED '%d.%d'", MyProcPid, currentLocalTransactionId));
 		}
-        foreach(connectionCell, connectionsWithDtmTransactions)
-        {
-            connection = (PGconn *) lfirst(connectionCell);
-			result = PQgetResult(connection);
-			if (PQresultStatus(result) != PGRES_COMMAND_OK)
-			{
-				ReportRemoteError(connection, result);
-			}
-			PQclear(result);
-			PQresultStatus(result); /* consume NULL result */
-        }
 	} else { 
-        foreach(connectionCell, connectionsWithDtmTransactions)
-        {
-            connection = (PGconn *) lfirst(connectionCell);
-            querySent = PQsendQuery(connection, psprintf("PREPARE TRANSACTION '%d.%d'; SELECT dtm_begin_prepare('%d.%d')", 
-														 MyProcPid, currentLocalTransactionId, MyProcPid, currentLocalTransactionId));
-            if (querySent == 0)
-            {
-                ReportRemoteError(connection, NULL);
-                PurgeConnection(connection);
-                allOk = false;
-                continue;
-            }
-            TRACE("shard_xtm: conn#%p: Sent dtm_begin_prepare to %s:%s\n", connection, PQhost(connection), PQport(connection));
-        }
-        if (allOk) 
-        { 
-            foreach(connectionCell, connectionsWithDtmTransactions)
-            {
-                connection = (PGconn *) lfirst(connectionCell);
-                result = PQgetResult(connection);
-                if (PQresultStatus(result) == PGRES_COMMAND_OK)
-                {
-					PQclear(result);
-					result = PQgetResult(connection);
-					if (PQresultStatus(result) == PGRES_TUPLES_OK)
-					{
-						PQresultStatus(result); /* consume NULL result */
-						querySent = PQsendQuery(connection, psprintf("SELECT dtm_prepare('%d.%d',0)", MyProcPid, currentLocalTransactionId));
-						if (querySent)
-						{
-							TRACE("shard_xtm: conn#%p: Sent dtm_prepare to %s:%s\n", connection, PQhost(connection), PQport(connection));
-							continue;
-						}
-					}
-                }
-				ReportRemoteError(connection, result);
-                PQclear(result);
-				allOk = false;
-            }
-            if (allOk) 
-            {
-                foreach(connectionCell, connectionsWithDtmTransactions)
-                {
-                    connection = (PGconn *) lfirst(connectionCell);
-					if (PQresultStatus(result) != PGRES_TUPLES_OK)
-					{
-						ReportRemoteError(connection, result);
-						PQclear(result);
-                        allOk = false;
-					} else { 
-						csn_t csn;
-						char* resp = PQgetvalue(result, 0, 0);
-						if (resp == NULL || (*resp) == '\0' || sscanf(resp, "%lld", &csn) != 1)
-						{
-							ReportRemoteError(connection, result);
-							PQclear(result);
-							allOk = false;
-						} else { 
-							if (csn > maxCSN) {
-								maxCSN = csn;
-							}
-							PQclear(result);
-							PQresultStatus(result); /* consume NULL result */
-						}
-					}
-				}
-				if (allOk) 
-				{
-					foreach(connectionCell, connectionsWithDtmTransactions)
-					{
-						connection = (PGconn *) lfirst(connectionCell);
-						querySent = PQsendQuery(connection, psprintf("SELECT dtm_end_prepare('%d.%d',%lld)", MyProcPid, currentLocalTransactionId, maxCSN));
-						if (querySent == 0)
-						{
-							ReportRemoteError(connection, NULL);
-							PurgeConnection(connection);
-							allOk = false;
-							continue;
-						} 
-						TRACE("shard_xtm: conn#%p: Sent dtm_end_prepare to %s:%s\n", connection, PQhost(connection), PQport(connection));
-					}
-					if (allOk)
-					{
-						foreach(connectionCell, connectionsWithDtmTransactions)
-						{
-							connection = (PGconn *) lfirst(connectionCell);
-							result = PQgetResult(connection);
-							if (PQresultStatus(result) != PGRES_TUPLES_OK)
-							{
-								ReportRemoteError(connection, result);
-								PQclear(result);
-								allOk = false;
-							} else { 
-								PQclear(result);
-								PQresultStatus(result); /* consume NULL result */
-								querySent = PQsendQuery(connection, psprintf("COMMIT PREPARED '%d.%d'", MyProcPid, currentLocalTransactionId));
-								if (querySent == 0)
-								{
-									ReportRemoteError(connection, NULL);
-									PurgeConnection(connection);
-									allOk = false;
-									continue;
-								}
-								TRACE("shard_xtm: conn#%p: Sent COMMIT PREPARED to %s:%s\n", connection, PQhost(connection), PQport(connection));
-							}
-						}
-						if (allOk)
-						{
-							foreach(connectionCell, connectionsWithDtmTransactions)
-							{
-								connection = (PGconn *) lfirst(connectionCell);
-								result = PQgetResult(connection);
-								if (PQresultStatus(result) != PGRES_COMMAND_OK)
-								{
-									ReportRemoteError(connection, result);
-									PQclear(result);
-									allOk = false;
-								} else { 
-									PQclear(result);
-									PQresultStatus(result); /* consume NULL result */
-								}
-							}
-							if (allOk)
-							{
-								goto TransactionCleanup;
-							}
-						}
-					}
-				}
-            }
-        }
-        foreach(connectionCell, connectionsWithDtmTransactions)
-        {
-            connection = (PGconn *) lfirst(connectionCell);
-			while ((result = PQgetResult(connection)) != NULL) { 
-				PQclear(result);
-			}
-			querySent = PQsendQuery(connection, psprintf("ROLLBACK PREPARED '%d.%d'", MyProcPid, currentLocalTransactionId));
-			if (querySent == 0)
-			{
-				ReportRemoteError(connection, NULL);
-				PurgeConnection(connection);
-			}
-		}
-        foreach(connectionCell, connectionsWithDtmTransactions)
-        {
-            connection = (PGconn *) lfirst(connectionCell);
-			result = PQgetResult(connection);
-			if (PQresultStatus(result) != PGRES_COMMAND_OK)
-			{
-				ReportRemoteError(connection, result);
-			}
-			PQclear(result);
-			PQresultStatus(result); /* consume NULL result */
-        }
-    }
-  TransactionCleanup:
+		RunDtmCommand("ROLLBACK");
+	}
 	/*
 	 * Calling unregister inside callback itself leads to segfault when
 	 * there are several callbacks on the same event.
